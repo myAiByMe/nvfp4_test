@@ -3,7 +3,6 @@
 
 # ── Core ──────────────────────────────────────────────────────
 torch>=2.3.0                  # Flash Attention SDPA, fused AdamW, torch.compile
-torchvision>=0.18.0           # optionnel mais souvent tiré par torch
 
 # ── HuggingFace ───────────────────────────────────────────────
 transformers>=4.40.0          # AutoTokenizer, LLaMA-3 tokenizer
@@ -17,21 +16,3 @@ tokenizers>=0.19.0            # backend Rust pour AutoTokenizer rapide
 tqdm>=4.66.0                  # barres de progression
 numpy>=1.26.0                 # mmap_mode, chunks .npy (pretrain)
 
-# ── Flash Attention ───────────────────────────────────────────
-flash-attn>=2.5.0             # FA2 sur RTX Pro 6000 (SM_120 Blackwell)
-                              # Compiler avec : pip install flash-attn --no-build-isolation
-
-# ── NVIDIA Transformer Engine (NVfp4 pretraining) ─────────────
-# Requis pour NVfp4 sur Blackwell SM_120 (RTX Pro 6000).
-# Fournit te.Linear (remplace nn.Linear dans les GEMMs)
-# et te.fp8_autocast (contexte FP4/FP8 natif Tensor Core).
-#
-# Installation :
-#   pip install transformer-engine[pytorch]
-#
-# OU depuis les wheels NVIDIA si pip échoue :
-#   pip install transformer-engine --extra-index-url https://pypi.nvidia.com
-transformer-engine[pytorch]>=1.10.0
-
-# ── Quantification post-training NVfp4 (inférence, optionnel) ─
-# nvidia-modelopt>=0.21.0     # TensorRT Model Optimizer (PTQ NVfp4)
