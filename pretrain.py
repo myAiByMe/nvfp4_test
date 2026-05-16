@@ -112,7 +112,7 @@ CONFIG = {
     'use_rope':              True,
     'use_yarn':              False,
     'yarn_scale':            4.0,
-    'yarn_original_max_len': 1024,
+    'yarn_original_max_len': 512,
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
@@ -244,28 +244,27 @@ if not os.path.exists(_data_file):
     sys.exit(1)
 
 print(f"\nChargement données : {_data_file}")
-_raw        = np.fromfile(_data_file, dtype=np.uint16)
-ALL_TOKENS  = torch.from_numpy(_raw.astype(np.int64))
-_total_tok  = len(ALL_TOKENS)
-print(f"  {_total_tok/1e9:.3f}B tokens  ({_total_tok*8/1e9:.1f}GB en RAM)")
+# memmap — données lues depuis le disque à la demande, pas de copie RAM
+_memmap_probe = np.memmap(_data_file, dtype=np.uint16, mode='r')
+_total_tok    = len(_memmap_probe)
+del _memmap_probe   # fermé ici — chaque worker rouvrira lazily
+print(f"  {_total_tok/1e9:.3f}B tokens  ({_total_tok*2/1e9:.1f}GB sur disque, memmap lazy)")
 
-# Shuffle par séquences (reproductible) puis split train/val
+# .bin déjà shufflé — indices séquentiels, pas de shuffle supplémentaire
 _seq_len_1  = CONFIG['max_seq_len'] + 1
 _n_seqs     = _total_tok // _seq_len_1
-_rng        = np.random.default_rng(CONFIG['shuffle_seed'])
-_idx        = _rng.permutation(_n_seqs)
-ALL_TOKENS  = ALL_TOKENS[:_n_seqs * _seq_len_1].reshape(_n_seqs, _seq_len_1)[_idx].reshape(-1)
+_idx        = np.arange(_n_seqs)
 
 _val_seqs   = min(CONFIG['val_tokens'] // _seq_len_1, int(_n_seqs * 0.05))
 _val_seqs   = max(_val_seqs, 1)
 _val_size   = _val_seqs * _seq_len_1
-_train_size = len(ALL_TOKENS) - _val_size
+_train_size = (_n_seqs - _val_seqs) * _seq_len_1
 
-TRAIN_TOKENS = ALL_TOKENS[:_train_size]
-VAL_TOKENS   = ALL_TOKENS[_train_size:]
-print(f"  train={_train_size/1e9:.3f}B  val={_val_size/1e6:.0f}M tokens")
+TRAIN_IDX = _idx[_val_seqs:]   # indices train (séquentiels)
+VAL_IDX   = _idx[:_val_seqs]   # indices val
+print(f"  train={_train_size/1e9:.3f}B  val={_val_size/1e6:.0f}M tokens  (memmap lazy, no shuffle)")
 
-_samples_per_epoch = _train_size // _seq_len_1
+_samples_per_epoch = len(TRAIN_IDX)
 _batches_per_epoch = math.ceil(_samples_per_epoch / CONFIG['batch_size'])
 STEPS_PER_EPOCH    = max(math.ceil(_batches_per_epoch / CONFIG['gradient_accumulation']), 1)
 TOTAL_STEPS        = STEPS_PER_EPOCH * CONFIG['num_epochs']
@@ -333,18 +332,27 @@ class WSDScheduler:
 
 class ChunkSubset(Dataset):
     """Dataset standard (padding classique, comportement v8)."""
-    def __init__(self, tokens, seq_len, pad_token_id):
+    def __init__(self, data_path, idx, seq_len, pad_token_id):
+        self.data_path    = data_path
+        self._data        = None      # ouvert lazily par chaque worker
+        self.idx          = idx
         self.seq_len      = seq_len
         self.pad_token_id = pad_token_id
-        self.num_samples  = len(tokens) // (seq_len + 1)
-        self.tokens       = tokens[:self.num_samples * (seq_len + 1)].share_memory_()
+        self.num_samples  = len(idx)
+
+    def _get_data(self):
+        if self._data is None:
+            self._data = np.memmap(self.data_path, dtype=np.uint16, mode='r')
+        return self._data
 
     def __len__(self):
         return self.num_samples
 
-    def __getitem__(self, idx):
-        start = idx * (self.seq_len + 1)
-        chunk = self.tokens[start:start + self.seq_len + 1]
+    def __getitem__(self, i):
+        start = int(self.idx[i]) * (self.seq_len + 1)
+        chunk = torch.from_numpy(
+            self._get_data()[start : start + self.seq_len + 1].astype(np.int64)
+        )
         return chunk[:-1].clone(), chunk[1:].clone()
 
 
@@ -353,25 +361,33 @@ class PackedChunkDataset(Dataset):
     Sequence Packing : pack plusieurs documents dans un bloc de max_seq_len tokens.
 
     Principe :
-      - Les tokens sont déjà concaténés dans `tokens` (séquences back-to-back)
+      - Les tokens sont lus depuis data_path (memmap lazy, séquences back-to-back)
       - On découpe en blocs de max_seq_len tokens (chaque bloc = 1 sample)
       - Le collate_fn calcule les cu_seqlens à partir des positions EOS dans chaque bloc
 
     Pas de padding → 100% tokens utiles.
     """
-    def __init__(self, tokens, seq_len, eos_token_id):
+    def __init__(self, data_path, idx, seq_len, eos_token_id):
+        self.data_path    = data_path
+        self._data        = None      # ouvert lazily par chaque worker
+        self.idx          = idx
         self.seq_len      = seq_len
         self.eos_token_id = eos_token_id
-        # Nombre de blocs complets
-        self.num_samples  = len(tokens) // (seq_len + 1)
-        self.tokens       = tokens[:self.num_samples * (seq_len + 1)].share_memory_()
+        self.num_samples  = len(idx)
+
+    def _get_data(self):
+        if self._data is None:
+            self._data = np.memmap(self.data_path, dtype=np.uint16, mode='r')
+        return self._data
 
     def __len__(self):
         return self.num_samples
 
-    def __getitem__(self, idx):
-        start = idx * (self.seq_len + 1)
-        block = self.tokens[start : start + self.seq_len + 1]
+    def __getitem__(self, i):
+        start = int(self.idx[i]) * (self.seq_len + 1)
+        block = torch.from_numpy(
+            self._get_data()[start : start + self.seq_len + 1].astype(np.int64)
+        )
         x = block[:-1].clone()   # [seq_len]
         y = block[1:].clone()    # [seq_len]
         return x, y
@@ -742,24 +758,25 @@ def train_epoch(
     # ── Datasets ────────────────────────────────────────────────
     if CONFIG['use_packing']:
         train_ds = PackedChunkDataset(
-            TRAIN_TOKENS, CONFIG['max_seq_len'],
+            _data_file, TRAIN_IDX, CONFIG['max_seq_len'],
             eos_token_id=tokenizer.eos_token_id,
         )
     else:
-        train_ds = ChunkSubset(TRAIN_TOKENS, CONFIG['max_seq_len'], tokenizer.pad_token_id)
+        train_ds = ChunkSubset(_data_file, TRAIN_IDX, CONFIG['max_seq_len'], tokenizer.pad_token_id)
 
-    val_ds  = ChunkSubset(VAL_TOKENS, CONFIG['max_seq_len'], tokenizer.pad_token_id)
+    val_ds  = ChunkSubset(_data_file, VAL_IDX, CONFIG['max_seq_len'], tokenizer.pad_token_id)
     total_seqs = len(train_ds)
 
     if skip_batches >= math.ceil(total_seqs / CONFIG['batch_size']):
         print(f"  Epoch déjà traitée, skip.")
         return global_step, total_training_time, epoch_start_step
 
-    shuffle_seed = CONFIG['shuffle_seed'] + (current_epoch - 1) * 1000
-    sampler      = SeededSampler(
-        n=total_seqs, seed=shuffle_seed,
-        skip_samples=skip_batches * CONFIG['batch_size'],
+    # .bin déjà shufflé — sampler séquentiel avec skip pour reprise checkpoint
+    _skip_samples = skip_batches * CONFIG['batch_size']
+    sampler       = torch.utils.data.SequentialSampler(
+        range(_skip_samples, total_seqs)
     )
+    print(f"  Sampler séquentiel : n={total_seqs - _skip_samples:,}  skip={_skip_samples:,}")
 
     # ── Collate selon mode ───────────────────────────────────────
     if CONFIG['use_packing']:
