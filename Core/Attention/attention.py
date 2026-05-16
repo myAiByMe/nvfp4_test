@@ -307,6 +307,10 @@ class MultiHeadAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
         scale = self._attn_scale()
 
+        # ── Cast BF16 — te.Linear (NVfp4) exige du bfloat16 en entrée ──
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
         # ── Projections (FP4 si dans fp8_autocast, BF16 sinon) ───
         q = self.q_proj(x)
         k = self.k_proj(x)
