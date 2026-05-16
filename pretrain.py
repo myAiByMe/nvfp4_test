@@ -26,6 +26,8 @@ NOUVEAUTÉS v10 :
 
 import os
 import contextlib
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="transformer_engine")
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"]      = "./CompileCache"
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
@@ -52,23 +54,26 @@ _TE_AVAILABLE   = False
 _nvfp4_recipe   = None
 
 try:
+    import transformer_engine
     import transformer_engine.pytorch as te
     from transformer_engine.common import recipe as _te_recipe
 
-    # Recette NVfp4 native (TE >= 1.10 + Blackwell)
+    # Recette NVfp4BlockScaling — nom exact dans TE 2.15.0 (Blackwell SM_120)
     try:
-        _nvfp4_recipe = _te_recipe.NVFP4()
-        print("  ⚡ Transformer Engine : recette NVfp4 disponible")
-    except AttributeError:
-        # Fallback FP8 E4M3 si la recette NVfp4 n'est pas encore dans cette version de TE
+        _nvfp4_recipe = _te_recipe.NVfp4BlockScaling()
+        print("  ⚡ Transformer Engine : recette NVfp4BlockScaling disponible")
+    except Exception as _e:
+        # Fallback FP8 E4M3 si NVfp4BlockScaling indisponible
         _nvfp4_recipe = _te_recipe.DelayedScaling(
             margin=0,
             fp8_format=_te_recipe.Format.E4M3,
         )
-        print("  ⚡ Transformer Engine : recette NVfp4 indisponible → fallback FP8 E4M3")
+        print(f"  ⚡ Transformer Engine : NVfp4BlockScaling échoué ({_e}) → fallback FP8 E4M3")
 
     _TE_AVAILABLE = True
-    print(f"  ✅ Transformer Engine chargé ({te.__version__})")
+    # FIX : te = transformer_engine.pytorch n'a pas __version__ → lire depuis le module racine
+    _te_version = getattr(transformer_engine, "__version__", "?")
+    print(f"  ✅ Transformer Engine chargé ({_te_version})")
 
 except ImportError:
     print("  ⚠️  transformer_engine non installé — NVfp4 désactivé, entraînement en BF16")
@@ -102,12 +107,12 @@ CONFIG = {
     'embed_dim':             1280,
     'num_heads':             20,
     'num_layers':            24,
-    'max_seq_len':           512,
+    'max_seq_len':           1024,
     'dropout':               0.0,
     'use_rope':              True,
     'use_yarn':              False,
     'yarn_scale':            4.0,
-    'yarn_original_max_len': 512,
+    'yarn_original_max_len': 1024,
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
@@ -121,7 +126,7 @@ CONFIG = {
     'adam_beta1':            0.9,
     'adam_beta2':            0.95,
     'adam_eps':              1e-8,
-    'num_epochs':            5,
+    'num_epochs':            1,
     'data_file':             './pretrain_data.bin',
     'val_tokens':            15_000_000,
     'warmup_ratio':          0.03,
@@ -481,23 +486,22 @@ def run_benchmark(model, vocab_size, seq_len, batch_size, steps=20,
     if dtype == torch.bfloat16 and model_dtype == torch.float32:
         model = model.to(torch.bfloat16)
 
-    # Contexte NVfp4 ou nullcontext
-    fp4_ctx = (
-        te.fp8_autocast(enabled=True, fp8_recipe=_nvfp4_recipe)
-        if (use_nvfp4 and _TE_AVAILABLE and _nvfp4_recipe is not None)
-        else contextlib.nullcontext()
-    )
+    # Factory NVfp4 — recréé à chaque appel (un GeneratorContextManager ne peut pas être réutilisé)
+    def fp4_ctx():
+        if use_nvfp4 and _TE_AVAILABLE and _nvfp4_recipe is not None:
+            return te.fp8_autocast(enabled=True, fp8_recipe=_nvfp4_recipe)
+        return contextlib.nullcontext()
 
     # Warmup
     for _ in range(3):
-        with fp4_ctx:
+        with fp4_ctx():
             with torch.amp.autocast(device, dtype=dtype):
                 model(x)
     torch.cuda.synchronize()
 
     t0 = time.time()
     for _ in range(steps):
-        with fp4_ctx:
+        with fp4_ctx():
             with torch.amp.autocast(device, dtype=dtype):
                 model(x)
     torch.cuda.synchronize()
