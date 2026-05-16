@@ -59,6 +59,10 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        # ── Cast BF16 — te.Linear (NVfp4) exige du bfloat16 en entrée ──
+        if self.use_nvfp4 and x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
         if self.use_swiglu:
             gate = F.silu(self.gate_proj(x))
             value = self.up_proj(x)
