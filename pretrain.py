@@ -58,17 +58,17 @@ try:
     import transformer_engine.pytorch as te
     from transformer_engine.common import recipe as _te_recipe
 
-    # Recette NVfp4BlockScaling — nom exact dans TE 2.15.0 (Blackwell SM_120)
+    # Recette NVFP4BlockScaling — nom exact dans TE 2.15.0 (Blackwell SM_120)
     try:
-        _nvfp4_recipe = _te_recipe.NVfp4BlockScaling()
-        print("  ⚡ Transformer Engine : recette NVfp4BlockScaling disponible")
+        _nvfp4_recipe = _te_recipe.NVFP4BlockScaling()
+        print("  ⚡ Transformer Engine : recette NVFP4BlockScaling disponible")
     except Exception as _e:
-        # Fallback FP8 E4M3 si NVfp4BlockScaling indisponible
+        # Fallback FP8 E4M3 si NVFP4BlockScaling indisponible
         _nvfp4_recipe = _te_recipe.DelayedScaling(
             margin=0,
             fp8_format=_te_recipe.Format.E4M3,
         )
-        print(f"  ⚡ Transformer Engine : NVfp4BlockScaling échoué ({_e}) → fallback FP8 E4M3")
+        print(f"  ⚡ Transformer Engine : NVFP4BlockScaling échoué ({_e}) → fallback FP8 E4M3")
 
     _TE_AVAILABLE = True
     # FIX : te = transformer_engine.pytorch n'a pas __version__ → lire depuis le module racine
