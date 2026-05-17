@@ -101,7 +101,7 @@ _args, _ = _parser.parse_known_args()
 
 _HF_TOKEN      = _args.hf_token
 _HF_REPO       = _args.hf_repo
-_HF_PUSH_INTERVAL = 60 * 60   # push checkpoint toutes les 1h
+_HF_PUSH_INTERVAL = 60 * 30   # push checkpoint toutes les 1h
 
 CONFIG = {
     'vocab_size':            None,
@@ -187,12 +187,22 @@ if device == 'cuda':
 def _hf_download():
     """
     1. Télécharge le repo HF (données + checkpoint éventuel) dans le répertoire courant.
-    2. Si un .pt est trouvé dans le repo, il sera utilisé pour reprendre le train.
+    2. Déplace le checkpoint .pt (et _info.json) vers ./Model/ pour que
+       CheckpointManager le trouve à l'emplacement CONFIG['checkpoint_file'].
     """
     if not _HF_TOKEN:
         print("  --hf-token absent : skip download HF (mode local)")
         return
+
+    # Si le checkpoint et les données existent déjà localement → skip download
+    _pt_local   = CONFIG['checkpoint_file']
+    _data_local = CONFIG['data_file']
+    if os.path.exists(_pt_local) and os.path.exists(_data_local):
+        print(f"  Fichiers locaux présents — skip download HF")
+        return
+
     try:
+        import shutil
         from huggingface_hub import snapshot_download, list_repo_files
         print(f"\nHugging Face — download depuis {_HF_REPO}")
         snapshot_download(
@@ -203,6 +213,25 @@ def _hf_download():
             ignore_patterns = ['*.md', '*.txt', '.gitattributes'],
         )
         print("  Download terminé")
+
+        # ── Déplacement checkpoint vers ./Model/ ─────────────────
+        model_dir = os.path.dirname(CONFIG['checkpoint_file'])   # './Model'
+        os.makedirs(model_dir, exist_ok=True)
+
+        pt_name   = os.path.basename(CONFIG['checkpoint_file'])  # 'HessGpt_pretrain.pt'
+        json_name = pt_name.replace('.pt', '_info.json')
+
+        for fname in (pt_name, json_name):
+            src = os.path.join('.', fname)
+            dst = os.path.join(model_dir, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.move(src, dst)
+                print(f"  Checkpoint déplacé : {src} → {dst}")
+            elif os.path.exists(src) and os.path.exists(dst):
+                # Le fichier local est plus récent → on écrase
+                shutil.move(src, dst)
+                print(f"  Checkpoint mis à jour : {dst}")
+
     except Exception as e:
         print(f"  WARN HF download : {e}")
 
@@ -627,6 +656,27 @@ class CheckpointManager:
                        'epoch_start_step': 0, 'skip_batches': 0,
                        'total_training_time': 0.0,
                        'training_history': {'validations': [], 'epochs': []}})
+
+        # ── Sanity check skip_batches ─────────────────────────────
+        # skip_batches doit toujours être égal à global_step * gradient_accumulation
+        # Si ce n'est pas le cas (sauvegarde corrompue / bug), on corrige automatiquement
+        _expected_skip = cp.get('global_step', 0) * CONFIG['gradient_accumulation']
+        _actual_skip   = cp.get('skip_batches', 0)
+        if _actual_skip != _expected_skip:
+            print(f"  ⚠️  skip_batches corrigé : {_actual_skip:,} → {_expected_skip:,} "
+                  f"(step={cp.get('global_step',0):,} × grad_acc={CONFIG['gradient_accumulation']})")
+            cp['skip_batches'] = _expected_skip
+            # Mettre à jour le json aussi pour la cohérence
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as f:
+                    _info = json.load(f)
+                _info['skip_batches'] = _expected_skip
+                with open(json_path, 'w') as f:
+                    json.dump(_info, f, indent=2, default=str)
+        else:
+            print(f"  ✅ skip_batches OK : {_actual_skip:,} "
+                  f"(step={cp.get('global_step',0):,} × grad_acc={CONFIG['gradient_accumulation']})")
+
         return cp
 
 
