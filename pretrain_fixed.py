@@ -119,7 +119,7 @@ CONFIG = {
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'batch_size':            112,
+    'batch_size':            97,
     'gradient_accumulation': 8,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -139,7 +139,7 @@ CONFIG = {
     'save_every_steps':      2000,
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
-    'compile_mode':          'max-autotune',
+    'compile_mode':          'default',
     'num_workers':           1,
     # ── Sequence Packing ────────────────────────────────────────
     'use_packing':           True,   # False = comportement v8 (padding classique)
