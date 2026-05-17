@@ -101,7 +101,7 @@ _args, _ = _parser.parse_known_args()
 
 _HF_TOKEN      = _args.hf_token
 _HF_REPO       = _args.hf_repo
-_HF_PUSH_INTERVAL = 60 * 60   # push checkpoint toutes les 1h
+_HF_PUSH_INTERVAL = 60 * 30   # push checkpoint toutes les 1h
 
 CONFIG = {
     'vocab_size':            None,
