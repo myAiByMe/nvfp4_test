@@ -43,6 +43,7 @@ import time
 import math
 import json
 import gc
+import threading
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from datetime import datetime
@@ -100,7 +101,7 @@ _args, _ = _parser.parse_known_args()
 
 _HF_TOKEN      = _args.hf_token
 _HF_REPO       = _args.hf_repo
-_HF_PUSH_INTERVAL = 3600   # push checkpoint toutes les 1h
+_HF_PUSH_INTERVAL = 60 * 60   # push checkpoint toutes les 1h
 
 CONFIG = {
     'vocab_size':            None,
@@ -118,7 +119,7 @@ CONFIG = {
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'batch_size':            140,
+    'batch_size':            97,
     'gradient_accumulation': 8,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -186,12 +187,14 @@ if device == 'cuda':
 def _hf_download():
     """
     1. Télécharge le repo HF (données + checkpoint éventuel) dans le répertoire courant.
-    2. Si un .pt est trouvé dans le repo, il sera utilisé pour reprendre le train.
+    2. Déplace le checkpoint .pt (et _info.json) vers ./Model/ pour que
+       CheckpointManager le trouve à l'emplacement CONFIG['checkpoint_file'].
     """
     if not _HF_TOKEN:
         print("  --hf-token absent : skip download HF (mode local)")
         return
     try:
+        import shutil
         from huggingface_hub import snapshot_download, list_repo_files
         print(f"\nHugging Face — download depuis {_HF_REPO}")
         snapshot_download(
@@ -202,6 +205,25 @@ def _hf_download():
             ignore_patterns = ['*.md', '*.txt', '.gitattributes'],
         )
         print("  Download terminé")
+
+        # ── Déplacement checkpoint vers ./Model/ ─────────────────
+        model_dir = os.path.dirname(CONFIG['checkpoint_file'])   # './Model'
+        os.makedirs(model_dir, exist_ok=True)
+
+        pt_name   = os.path.basename(CONFIG['checkpoint_file'])  # 'HessGpt_pretrain.pt'
+        json_name = pt_name.replace('.pt', '_info.json')
+
+        for fname in (pt_name, json_name):
+            src = os.path.join('.', fname)
+            dst = os.path.join(model_dir, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                shutil.move(src, dst)
+                print(f"  Checkpoint déplacé : {src} → {dst}")
+            elif os.path.exists(src) and os.path.exists(dst):
+                # Le fichier local est plus récent → on écrase
+                shutil.move(src, dst)
+                print(f"  Checkpoint mis à jour : {dst}")
+
     except Exception as e:
         print(f"  WARN HF download : {e}")
 
@@ -553,22 +575,12 @@ def print_benchmark(label, metrics):
 class CheckpointManager:
     def __init__(self, path):
         self.path          = path
-        self._last_hf_push = 0.0   # timestamp du dernier push HF
+        self._last_hf_push = 0.0
+        self._save_thread  = None
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    def save(self, model, optimizers, scheduler, metadata):
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
-        muon_opt, adamw_opt = optimizers
-        info_snapshot = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
-        cp = {
-            'model_state_dict':     m.state_dict(),
-            'muon_state_dict':      muon_opt.state_dict(),
-            'adamw_state_dict':     adamw_opt.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'metadata':             info_snapshot,
-        }
-        json_path = self.path.replace('.pt', '_info.json')
-        new_path  = json_path + '.new'
+    def _write(self, cp, info_snapshot, json_path, step, epoch):
+        new_path = json_path + '.new'
         with open(new_path, 'w') as f:
             json.dump(info_snapshot, f, indent=2, default=str)
         tmp = self.path + '.tmp'
@@ -577,18 +589,41 @@ class CheckpointManager:
         if os.path.exists(json_path):
             os.remove(json_path)
         os.replace(new_path, json_path)
-        print(f"  SAVE → epoch={metadata['current_epoch']}  "
-              f"step={metadata['global_step']:,}  [{self.path}]")
+        # ── Push HF (dans le thread background) ──────────────────
+        if _HF_TOKEN:
+            hf_push_checkpoint(self.path, step=step, epoch=epoch)
 
-        # ── Push HF toutes les _HF_PUSH_INTERVAL secondes ────────
-        now = time.time()
-        if _HF_TOKEN and (now - self._last_hf_push) >= _HF_PUSH_INTERVAL:
-            hf_push_checkpoint(
-                self.path,
-                step  = metadata['global_step'],
-                epoch = metadata['current_epoch'],
-            )
-            self._last_hf_push = now
+    def save(self, model, optimizers, scheduler, metadata):
+        # Attendre la sauvegarde précédente si encore en cours
+        if self._save_thread is not None and self._save_thread.is_alive():
+            self._save_thread.join()
+
+        m = model._orig_mod if hasattr(model, '_orig_mod') else model
+        muon_opt, adamw_opt = optimizers
+        info_snapshot = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
+        # state_dict() copie les tenseurs en CPU — snapshot atomique dans le thread principal
+        cp = {
+            'model_state_dict':     m.state_dict(),
+            'muon_state_dict':      muon_opt.state_dict(),
+            'adamw_state_dict':     adamw_opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'metadata':             info_snapshot,
+        }
+        json_path = self.path.replace('.pt', '_info.json')
+        print(f"  SAVE → epoch={metadata['current_epoch']}  "
+              f"step={metadata['global_step']:,}  [{self.path}] (async)")
+        # Écriture disque dans un thread background — le GPU continue à tourner
+        self._save_thread = threading.Thread(
+            target=self._write,
+            args=(cp, info_snapshot, json_path,
+                  metadata['global_step'], metadata['current_epoch']),
+            daemon=True,
+        )
+        self._save_thread.start()
+
+    def wait(self):
+        if self._save_thread is not None and self._save_thread.is_alive():
+            self._save_thread.join()
 
     def load(self):
         if not os.path.exists(self.path):
@@ -622,7 +657,8 @@ class CheckpointManager:
 @torch.no_grad()
 def validate(model, val_loader, max_batches=50):
     model.eval()
-    total_loss, n = 0.0, 0
+    total_loss = torch.zeros(1, device=device)
+    n = 0
     ae  = (device == 'cuda')
     adt = torch.bfloat16 if ae else torch.float32
     try:
@@ -633,11 +669,11 @@ def validate(model, val_loader, max_batches=50):
             x, y = batch[0].to(device), batch[1].to(device)
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
-            total_loss += loss.item()
+            total_loss += loss.detach()
             n += 1
     finally:
         model.train()
-    avg = total_loss / max(n, 1)
+    avg = (total_loss / max(n, 1)).item()  # unique sync CPU-GPU
     return math.exp(min(avg, 10)), avg
 
 
@@ -734,6 +770,7 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
             {'params': adamw_nodecay, 'weight_decay': 0.0,          'is_muon': False},
         ],
         lr=lr, betas=betas, eps=eps, fused=(device == 'cuda'),
+        capturable=(device == 'cuda'),
     )
     print(f"\nOptimizer Muon+MARS-M + AdamW :")
     print(f"  Muon : {len(muon_params)} tenseurs  lr={lr_muon:.2e}")
@@ -791,13 +828,14 @@ def train_epoch(
 
     train_loader = DataLoader(
         train_ds, batch_size=CONFIG['batch_size'], sampler=sampler,
-        num_workers=CONFIG['num_workers'], pin_memory=True,
-        persistent_workers=True, prefetch_factor=2,
+        num_workers=4, pin_memory=True,
+        persistent_workers=True, prefetch_factor=3,
         drop_last=True, collate_fn=_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=CONFIG['batch_size'],
-        shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True,
+        shuffle=False, num_workers=4, pin_memory=True,
+        persistent_workers=True, prefetch_factor=3,
     )
 
     total_batches = total_seqs // CONFIG['batch_size']
@@ -806,9 +844,11 @@ def train_epoch(
           f"val={len(val_loader):,} | packing={'ON' if CONFIG['use_packing'] else 'OFF'}")
 
     model.train()
-    epoch_loss, valid_batches     = 0.0, 0
-    accumulated_steps             = 0
-    running_loss, running_batches = 0.0, 0
+    epoch_loss_t    = torch.zeros(1, device=device)
+    valid_batches   = 0
+    accumulated_steps = 0
+    running_loss_t  = torch.zeros(1, device=device)
+    running_batches = 0
     t_start = time.time()
     ae  = (device == 'cuda')
     adt = torch.bfloat16 if ae else torch.float32
@@ -854,18 +894,12 @@ def train_epoch(
                     )
                     loss = loss / CONFIG['gradient_accumulation']
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                muon_opt.zero_grad(set_to_none=True)
-                adamw_opt.zero_grad(set_to_none=True)
-                accumulated_steps = 0
-                continue
-
             loss.backward()
             accumulated_steps += 1
 
             is_last = (batch_idx + 1 == num_batches)
             if (accumulated_steps % CONFIG['gradient_accumulation'] == 0) or is_last:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'], foreach=True)
                 muon_opt.step()
                 adamw_opt.step()
                 muon_opt.zero_grad(set_to_none=True)
@@ -876,7 +910,7 @@ def train_epoch(
 
                 if global_step % CONFIG['validate_every_steps'] == 0:
                     val_ppl, val_loss = validate(model, val_loader, CONFIG['val_batches'])
-                    avg = running_loss / max(running_batches, 1)
+                    avg = (running_loss_t / max(running_batches, 1)).item()  # sync unique ici
                     print(f"\n  step={global_step:,} | "
                           f"train={avg:.4f} ppl={math.exp(min(avg,10)):.1f} | "
                           f"val={val_loss:.4f} ppl={val_ppl:.1f} | "
@@ -886,7 +920,8 @@ def train_epoch(
                         'val_loss': val_loss, 'val_ppl': val_ppl,
                         'train_loss': avg, 'lr': scheduler.get_last_lr()[0],
                     })
-                    running_loss, running_batches = 0.0, 0
+                    running_loss_t  = torch.zeros(1, device=device)
+                    running_batches = 0
 
                 if global_step % CONFIG['save_every_steps'] == 0:
                     checkpoint_manager.save(model, optimizers, scheduler, metadata={
@@ -898,16 +933,18 @@ def train_epoch(
                         'training_history':    training_history,
                     })
 
-            raw = loss.item() * CONFIG['gradient_accumulation']
-            epoch_loss      += raw
-            running_loss    += raw
+            raw_t = loss.detach() * CONFIG['gradient_accumulation']
+            epoch_loss_t    += raw_t
+            running_loss_t  += raw_t
             valid_batches   += 1
             running_batches += 1
 
             if batch_idx % 20 == 0:
-                avg = running_loss / max(running_batches, 1)
+                # Sync CPU-GPU seulement toutes les 20 itérations
+                raw_f = raw_t.item()
+                avg   = (running_loss_t / max(running_batches, 1)).item()
                 pbar.set_postfix(
-                    loss=f'{raw:.4f}', avg=f'{avg:.4f}',
+                    loss=f'{raw_f:.4f}', avg=f'{avg:.4f}',
                     ppl=f'{math.exp(min(avg,10)):.1f}',
                     lr=f'{scheduler.get_last_lr()[0]:.2e}',
                     step=f'{global_step:,}',
@@ -933,7 +970,7 @@ def train_epoch(
 
     elapsed = time.time() - t_start
     total_training_time += elapsed
-    avg_loss = epoch_loss / max(valid_batches, 1)
+    avg_loss = (epoch_loss_t / max(valid_batches, 1)).item()  # unique sync fin d'epoch
     print(f"\n  Epoch {current_epoch} terminée | loss={avg_loss:.4f} | {elapsed/60:.1f}min")
 
     training_history['epochs'].append({
@@ -1125,6 +1162,7 @@ def main():
         'total_training_time': total_training_time,
         'training_history': training_history,
     })
+    ckpt_mgr.wait()  # attendre que la dernière sauvegarde async soit terminée
     history_path = CONFIG['checkpoint_file'].replace('.pt', '_history.json')
     with open(history_path, 'w') as f:
         json.dump(training_history, f, indent=2, default=str)
