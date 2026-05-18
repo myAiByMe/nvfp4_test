@@ -136,7 +136,7 @@ CONFIG = {
     'validate_every_steps':  500,
     'val_batches':           50,
     'shuffle_seed':          42,
-    'save_every_steps':      2000,
+    'save_every_steps':      1000,
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
     'compile_mode':          'default',
