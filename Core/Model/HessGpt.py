@@ -152,6 +152,21 @@ class HessGPT(nn.Module):
 
         self.output_head.weight = self.token_embeddings.weight   # weight tying
 
+        self.gradient_checkpointing = False
+
+    # ─────────────────────────────────────────────────────────────
+    # Gradient Checkpointing
+    # ─────────────────────────────────────────────────────────────
+    def enable_gradient_checkpointing(self):
+        """Active le gradient checkpointing sur tous les TransformerBlocks.
+        Réduit la VRAM (~30-40%) au prix d'un recalcul du forward à la backward.
+        À appeler uniquement depuis le modèle non-compilé (_orig_mod).
+        """
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
     # ─────────────────────────────────────────────────────────────
     # Init
     # ─────────────────────────────────────────────────────────────
@@ -240,18 +255,41 @@ class HessGPT(nn.Module):
         # ── Transformer Blocks ────────────────────────────────────
         new_past_kv: Optional[List[KVCache]] = [] if use_kv_cache else None
 
+        use_gc = self.gradient_checkpointing and self.training and not use_kv_cache
+
         for i, block in enumerate(self.blocks):
             layer_past = past_kv[i] if past_kv is not None else None
-            x, new_kv  = block(
-                x,
-                mask         = mask,
-                past_kv      = layer_past,
-                use_kv_cache = use_kv_cache,
-                cu_seqlens_q = cu_seqlens_q,
-                cu_seqlens_k = cu_seqlens_k,
-                max_seqlen_q = max_seqlen_q,
-                max_seqlen_k = max_seqlen_k,
-            )
+
+            if use_gc:
+                from torch.utils.checkpoint import checkpoint as _ckpt
+
+                def _block_fwd(x_, _b=block, _lp=layer_past):
+                    out, _kv = _b(
+                        x_,
+                        mask         = mask,
+                        past_kv      = _lp,
+                        use_kv_cache = False,
+                        cu_seqlens_q = cu_seqlens_q,
+                        cu_seqlens_k = cu_seqlens_k,
+                        max_seqlen_q = max_seqlen_q,
+                        max_seqlen_k = max_seqlen_k,
+                    )
+                    return out
+
+                x      = _ckpt(_block_fwd, x, use_reentrant=False)
+                new_kv = None
+            else:
+                x, new_kv = block(
+                    x,
+                    mask         = mask,
+                    past_kv      = layer_past,
+                    use_kv_cache = use_kv_cache,
+                    cu_seqlens_q = cu_seqlens_q,
+                    cu_seqlens_k = cu_seqlens_k,
+                    max_seqlen_q = max_seqlen_q,
+                    max_seqlen_k = max_seqlen_k,
+                )
+
             if use_kv_cache:
                 new_past_kv.append(new_kv)
 
