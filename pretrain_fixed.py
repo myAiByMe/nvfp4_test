@@ -154,6 +154,13 @@ CONFIG = {
     # désactivé → forward repassé en BF16 pour recovery de précision.
     # Stratégie issue de l'article NVIDIA arXiv 2509.25149.
     'healing_ratio':         0.90,
+    # ── Gradient Checkpointing (healing) ────────────────────────
+    # True → active le gradient checkpointing automatiquement au
+    # déclenchement du healing (derniers 10%) pour compenser la
+    # hausse de VRAM liée au passage en BF16.
+    # Réduit la VRAM des activations de ~30-40% au prix d'un
+    # recalcul du forward pendant la backward.
+    'gc_on_healing':         True,
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -816,6 +823,7 @@ def train_epoch(
     global_step, total_training_time,
     current_epoch, epoch_start_step,
     skip_batches=0,
+    raw_model=None,
 ):
     muon_opt, adamw_opt = optimizers
     label = f"Epoch {current_epoch}/{CONFIG['num_epochs']}"
@@ -905,6 +913,11 @@ def train_epoch(
                 print(f"\n  HEALING activé à step={global_step:,} "
                       f"(seuil={healing_step:,}) — forward repassé en BF16")
                 _healing_logged = True
+                # ── Gradient Checkpointing pour compenser la hausse VRAM BF16 ──
+                if CONFIG.get('gc_on_healing', True) and raw_model is not None:
+                    raw_model.enable_gradient_checkpointing()
+                    print(f"  Gradient checkpointing activé (gc_on_healing=True) — "
+                          f"VRAM activations réduite ~30-40%")
 
             fp4_ctx = (
                 te.fp8_autocast(enabled=True, fp8_recipe=_nvfp4_recipe)
@@ -1040,6 +1053,9 @@ def main():
         healing_step_main = int(TOTAL_STEPS * CONFIG['healing_ratio'])
         print(f"  Healing BF16 à partir du step {healing_step_main:,} "
               f"({CONFIG['healing_ratio']:.0%} de {TOTAL_STEPS:,} steps)")
+        if CONFIG.get('gc_on_healing', True):
+            print(f"  Gradient checkpointing activé automatiquement au healing "
+                  f"(gc_on_healing=True)")
 
     # ── BENCHMARK PHASE 0 (baseline avant compile) ───────────────
     if device == 'cuda':
@@ -1160,6 +1176,7 @@ def main():
                 global_step=global_step, total_training_time=total_training_time,
                 current_epoch=epoch, epoch_start_step=epoch_start_step,
                 skip_batches=_skip,
+                raw_model=raw_model,
             )
             cp = None
             skip_batches = 0
