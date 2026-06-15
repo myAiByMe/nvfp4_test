@@ -308,7 +308,9 @@ class MultiHeadAttention(nn.Module):
         scale = self._attn_scale()
 
         # ── Cast BF16 — te.Linear (NVfp4) exige du bfloat16 en entrée ──
-        if x.dtype != torch.bfloat16:
+        # Gardé par use_nvfp4 : en inférence standard (nn.Linear), on
+        # respecte le dtype du modèle (float32 CPU ou bfloat16 GPU).
+        if self.use_nvfp4 and x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
 
         # ── Projections (FP4 si dans fp8_autocast, BF16 sinon) ───
